@@ -1,0 +1,17 @@
+{
+  "gmail": {
+    "client_id": "YOUR_GOOGLE_CLIENT_ID",
+    "client_secret": "YOUR_GOOGLE_CLIENT_SECRET",
+    "refresh_token": "YOUR_GOOGLE_REFRESH_TOKEN"
+  },
+  "discord": {
+    "webhook_url": "https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN"
+  },
+  "scan": {
+    "keywords": ["accenture", "cognizant"],
+    "initial_lookback_seconds": 86400,
+    "overlap_seconds": 300,
+    "include_spam_trash": true,
+    "exclude_labels": ["SENT", "DRAFT"]
+  }
+}
