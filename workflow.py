@@ -1,4 +1,4 @@
-"""One quiet Gmail scan: Redis config/state, Discord webhook delivery."""
+"""One Gmail scan with Redis-backed Discord delivery and dashboard records."""
 import json
 import os
 import random
@@ -64,9 +64,9 @@ def validate_config(cfg):
         not isinstance(k, str) or not k.strip() for k in keywords
     ):
         raise ValueError("Invalid keywords")
-    for key, minimum in (("initial_lookback_seconds", 1), ("overlap_seconds", 0)):
-        if type(scan.get(key)) is not int or scan[key] < minimum:
-            raise ValueError("Invalid scan duration")
+    if (type(scan.get("initial_lookback_seconds")) is not int or
+            scan["initial_lookback_seconds"] < 1):
+        raise ValueError("Invalid initial lookback")
     if type(scan.get("include_spam_trash")) is not bool:
         raise ValueError("Invalid spam setting")
     if not isinstance(scan.get("exclude_labels"), list) or any(
@@ -125,6 +125,17 @@ def discord_send(url, alert):
     raise RuntimeError("Discord delivery failed")
 
 
+def validate_state(state, account, end):
+    if (state.get("version") != 2 or state.get("account") != account or
+            type(state.get("tracking_start")) is not int or
+            not 0 <= state["tracking_start"] <= end or
+            type(state.get("last_scan")) is not int or state["last_scan"] > end or
+            not isinstance(state.get("posted"), list) or
+            not all(isinstance(mid, str) for mid in state["posted"]) or
+            not isinstance(state.get("pending"), dict)):
+        raise ValueError("State account/schema/clock mismatch")
+
+
 def deliver(redis, state, url, guard):
     failures = False
     for message_id in list(state["pending"]):
@@ -134,6 +145,7 @@ def deliver(redis, state, url, guard):
         except Exception:
             failures = True
             continue
+        state["posted"].append(message_id)
         del state["pending"][message_id]
         # Stop if state cannot be saved after a confirmed delivery.
         guard()
@@ -147,14 +159,14 @@ def scan(redis, session, cfg, state, guard, now=None):
     account = gmail_get(session, "/profile")["emailAddress"]
     scan_cfg = cfg["scan"]
     if state is None:
-        state = {"version": 1, "account": account,
-                 "last_scan": end - scan_cfg["initial_lookback_seconds"], "seen": [], "pending": {}}
+        state = {"version": 2, "account": account,
+                 "tracking_start": max(0, end - scan_cfg["initial_lookback_seconds"]),
+                 "last_scan": 0, "posted": [], "pending": {}}
         redis.save(STATE_KEY, state)
-    if (state.get("version") != 1 or state["account"] != account or
-            type(state["last_scan"]) is not int or state["last_scan"] > end):
-        raise ValueError("State account/schema/clock mismatch")
-    seen = set(state["seen"])
-    query = f"after:{max(0, state['last_scan'] - scan_cfg['overlap_seconds'])} before:{end}"
+    validate_state(state, account, end)
+    posted = set(state["posted"])
+    # Keep the original after: boundary so a later keyword can match a prior scan.
+    query = f"after:{state['tracking_start']} before:{end}"
     page = None
     while True:
         guard()
@@ -166,8 +178,6 @@ def scan(redis, session, cfg, state, guard, now=None):
         for item in batch.get("messages", []):
             guard()
             mid = item["id"]
-            if mid in seen:
-                continue
             msg = gmail_get(session, "/messages/" + mid, {"format": "raw"})
             if not set(msg.get("labelIds", [])) & set(scan_cfg["exclude_labels"]):
                 body = parse_message(msg["raw"])
@@ -180,16 +190,28 @@ def scan(redis, session, cfg, state, guard, now=None):
                     received_at = datetime.fromtimestamp(
                         int(msg["internalDate"]) / 1000, tz=timezone.utc
                     ).isoformat()
-                    record = {**alert, "received_at": received_at, "account": account}
                     guard()
-                    # The message ID is the hash field, so retries replace rather than duplicate.
-                    redis.command("HSET", DASHBOARD_KEY, mid,
-                                  json.dumps(record, ensure_ascii=False))
-                    state["pending"][mid] = alert
-            state["seen"].append(mid)
-            seen.add(mid)
-            guard()
-            redis.save(STATE_KEY, state)
+                    old = redis.command("HGET", DASHBOARD_KEY, mid)
+                    merged_keywords = list(hits)
+                    if old is not None:
+                        previous = json.loads(old)
+                        if previous.get("account") != account or previous.get("event_id") != mid:
+                            raise ValueError("Dashboard record account/ID mismatch")
+                        known = {hit.casefold() for hit in merged_keywords}
+                        for keyword in previous["matched_keywords"]:
+                            if keyword.casefold() not in known:
+                                merged_keywords.append(keyword)
+                                known.add(keyword.casefold())
+                    record = {**alert, "matched_keywords": merged_keywords,
+                              "received_at": received_at, "account": account}
+                    # The message ID is the hash field; new keyword matches update it.
+                    if old is None or record != previous:
+                        redis.command("HSET", DASHBOARD_KEY, mid,
+                                      json.dumps(record, ensure_ascii=False))
+                    if mid not in posted and mid not in state["pending"]:
+                        state["pending"][mid] = alert
+                        guard()
+                        redis.save(STATE_KEY, state)
         page = batch.get("nextPageToken")
         if not page:
             break
@@ -215,9 +237,8 @@ def run():
         state = redis.load(STATE_KEY)
         with gmail_session(cfg) as session:
             account = gmail_get(session, "/profile")["emailAddress"]
-            if state is not None and state.get("account") != account:
-                raise ValueError("State account mismatch")
             if state is not None:
+                validate_state(state, account, int(time.time()))
                 deliver(redis, state, cfg["discord"]["webhook_url"], guard)
             state = scan(redis, session, cfg, state, guard)
         if not deliver(redis, state, cfg["discord"]["webhook_url"], guard):
@@ -230,5 +251,4 @@ if __name__ == "__main__":
     try:
         run()
     except Exception:
-        # No email content, credentials, URLs, or exception tracebacks in logs.
         sys.exit(1)
